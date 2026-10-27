@@ -1,12 +1,14 @@
 # Design Notes
 
 ## Overview
+'Hi this is Adarsh'
+'YES'
 
 The library is a single `http.Handler` wrapper. It intercepts POST requests carrying an
 `Idempotency-Key` header, runs the real handler at most once per key, and replays the
 captured response to any subsequent caller presenting the same key.
 
-State machine per key:
+State machine per key: 
 
 ```
 (absent) --[first request]--> in-flight --[commit]--> done --[TTL expires]--> (absent)

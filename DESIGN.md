@@ -1,135 +1,187 @@
-# Design Notes
+# Idempotency Middleware Design
 
-## Overview
-'Hi this is Adarsh'
-'YES'
+This document describes the implementation, its behavioral choices, and the limits of
+its guarantees. See [README.md](README.md) for setup and usage.
 
-The library is a single `http.Handler` wrapper. It intercepts POST requests carrying an
-`Idempotency-Key` header, runs the real handler at most once per key, and replays the
-captured response to any subsequent caller presenting the same key.
+## Scope and architecture
 
-State machine per key: 
+`New(store, next)` wraps an `http.Handler` and uses a shared, in-memory `Store` to
+coordinate requests carrying an `Idempotency-Key` header. The intended use is retryable
+POST endpoints, but the wrapper does not check the HTTP method: every keyed request
+goes through the same logic. Requests with an empty or missing key pass through.
 
+The implementation uses only the Go standard library:
+
+| Component | Responsibility |
+| --- | --- |
+| [middleware.go](middleware.go) | Read and restore the request body, fingerprint requests, capture responses, and replay results |
+| [store.go](store.go) | Atomically claim keys, publish results, abandon panicked executions, and remove records |
+| [middleware_test.go](middleware_test.go) | Exercise replay, concurrency, failures, expiry, and independent keys |
+
+An existing, unexpired record suppresses another execution for the same key and
+fingerprint. This is a process-local guarantee while that record remains available.
+Expiry, eviction, process restart, or abandonment after a panic can permit execution
+again. The store does not make handler side effects transactional.
+
+## Request lifecycle
+
+1. If the key is empty, call the handler directly.
+2. Read the entire request body. A read error returns `400 Bad Request` without
+   creating a record. Restore the body so the handler can read the captured bytes.
+3. Compute the fingerprint and atomically retrieve or create the key's record under
+   the store mutex.
+4. For an existing record, reject a fingerprint mismatch with `422 Unprocessable
+   Entity`. Otherwise, wait for its result or the retry's context cancellation.
+5. For a new record, run the handler with a buffering response writer. When it
+   returns, publish the captured status, headers, and body, then replay them to the
+   original caller. Waiting retries replay that same result.
+
+```mermaid
+stateDiagram-v2
+    [*] --> InFlight: New key
+    InFlight --> Done: Handler returns; close ready
+    InFlight --> Absent: Handler panics; release waiters with 503
+    Done --> Absent: TTL expiry or capacity eviction
+    Absent --> InFlight: Next request claims key
 ```
-(absent) --[first request]--> in-flight --[commit]--> done --[TTL expires]--> (absent)
-                                        --[panic ]-> (absent, waiters get 503)
+
+The diagram shows the normal lifecycle. Lookup can also replace an expired in-flight
+record; the consequences are described under retention below.
+
+## Behavioral decisions
+
+### Wait for an in-flight result
+
+Each record has a `ready` channel. Matching retries wait until the original handler
+finishes, then receive its captured response. This avoids requiring clients to poll
+following an immediate conflict response.
+
+The retry's context can interrupt the wait, producing `503 Service Unavailable`.
+Canceling a waiter does not abandon the original execution. There is no middleware
+timeout or waiter limit, so callers and the HTTP server need appropriate deadlines
+and concurrency controls.
+
+The store mutex protects map operations; it is released before handler execution or
+waiting. Different keys can execute concurrently. Response fields are populated
+before `ready` is closed, and waiting readers synchronize through that channel.
+
+### Reject a reused key with a different fingerprint
+
+The fingerprint is the hex-encoded SHA-256 hash of:
+
+```text
+method + NUL + URL.Path + NUL + raw body bytes
 ```
 
----
+Separators distinguish field boundaries for ordinary HTTP methods and paths.
+Bodies are compared byte for byte: equivalent JSON with different whitespace is a
+different request. Query parameters, host, headers, and authenticated identity are
+not included.
 
-## Decision 1: retry arrives while first execution is still running
+Keys occupy one namespace per `Store`, including across handlers sharing it. Clients
+must use a unique key per logical operation. Applications must account for tenant
+and user isolation when choosing the store and where authentication runs, since a
+matching retry bypasses the wrapped handler.
 
-**Choice: block until the original completes, then replay.**
+A mismatch returns `422` immediately and leaves the existing record untouched.
+Replaying despite a mismatch would hide client errors and could return a result for
+another operation. An immediate `409` for an in-flight request is a possible API
+policy, but this implementation waits for matching retries and uses `422` for
+incompatible key reuse.
 
-The middleware stores a `chan struct{}` per entry. Subsequent callers with the same key
-and fingerprint wait on that channel (respecting their request context deadline). When the
-original handler returns, the channel is closed and all waiters unblock to receive the same
-captured response.
+### Retain error responses
 
-**Rejected: return 409 Conflict immediately.**
-A 409 is a coherent response, but it pushes retry-after logic onto every caller. In
-practice, callers retry on 409 just as eagerly as on network errors, adding round-trips
-without benefit. Blocking inside the middleware is bounded by the caller's own context
-timeout, so goroutine accumulation is naturally capped.
+Every handler response is retained after the handler returns, including `4xx` and
+`5xx`. A failure status does not prove that no side effect occurred: a charge may
+have succeeded before a later operation failed. Deleting a record on `5xx` would
+allow a retry to repeat that side effect.
 
----
+On a handler panic, buffered output is not committed. The middleware removes the
+active record, releases its waiters with a synthetic `503`, and re-panics so outer
+recovery middleware or the HTTP server can handle the original request. A later
+request may execute again. A panic can also occur after side effects, so this
+recovery policy does not guarantee at-most-once side effects.
 
-## Decision 2: retry has the same key but a different body or route
+### Buffer responses before replay
 
-**Choice: return 422 Unprocessable Entity.**
+The original caller and retries receive the captured status, header values, and body.
+The body is copied on commit; the captured header map is retained. Handlers must
+finish mutating their response before returning.
 
-The fingerprint is `sha256(method || 0x00 || path || 0x00 || body)`. A mismatch with a
-stored key is an unambiguous client error — the caller is reusing a key across logically
-different operations. The request is rejected immediately; the stored entry is untouched.
+The writer implements `http.ResponseWriter`, without optional interfaces such as
+`http.Flusher` or `http.Hijacker`. Streaming and upgraded connections are outside its
+intended use. It also differs from the standard writer: `Write` does not implicitly
+lock in status `200`, and headers are captured at handler return rather than
+snapshotted at `WriteHeader`. Handlers relying on those details need additional
+compatibility work.
 
-Null-byte separators prevent cross-field collisions where two differently-split inputs
-produce the same concatenation.
+Requests and responses are fully buffered, with no byte limit in the library.
+Applications should bound request sizes and use it for responses small enough to
+retain in memory.
 
-**Rejected: silently ignore the mismatch and replay the stored response.**
-Ignoring the mismatch would mask client bugs. A caller that reuses keys incorrectly should
-be told immediately so it can fix the error, not receive a quietly wrong answer.
+## Retention and capacity
 
-**Rejected: return 409 Conflict.**
-409 implies a transient state. 422 is semantically correct: the entity (the re-used key)
-cannot be processed because the request is malformed relative to the existing record.
+`NewStore(max, ttl)` creates a map and starts a background sweep every `ttl/2`.
+Use a positive capacity and a TTL large enough that `ttl/2` is positive; constructor
+arguments are not validated. There is currently no shutdown method for the sweeper,
+so stores should be long-lived rather than created per request.
 
----
+Expiry is set to creation time plus TTL, **not completion time plus TTL**. Lookup
+removes an expired record and inserts a replacement, even if the previous handler
+is still running. A handler that outlives the TTL can therefore overlap with a new
+execution for the same key. The sweep only removes expired completed records.
+Choose a TTL comfortably above the expected handler duration and retry window;
+strict protection for long-running handlers would require changing this behavior.
 
-## Decision 3: the first execution failed
+At capacity, insertion attempts to evict an expired completed record first. Otherwise,
+it evicts the completed record with the earliest **creation** time. This is not LRU
+and is not ordered by completion time. The scan is O(n), avoiding the extra state
+needed for a linked-list eviction policy.
 
-**Choice: cache and replay all terminal responses, including 5xx.**
+Capacity eviction never selects an in-flight record. If all records are in flight,
+insertion proceeds without eviction and the map can exceed `max`. The entry cap is
+therefore a retention target rather than a hard memory bound. Even within that
+target, response sizes and waiting goroutines remain unbounded. TTL alone would
+also fail to bound peak memory; a strict bound needs admission control and byte limits.
 
-Once `ServeHTTP` returns — at any status code — the response is committed and stored.
-Retries receive the exact same status and body.
+Eviction can shorten the retry window below the configured TTL. Once a record is
+gone, the next request is treated as new.
 
-Rationale: the handler ran. We cannot know what side effects occurred before the failure.
-Allowing re-execution on 5xx risks double execution (double charge, double insert). The
-caller receives a truthful error response and can escalate through out-of-band recovery
-rather than by retrying blindly.
+## Persistence and multiple instances
 
-The one exception is a handler `panic`. A panic propagates before any response is written,
-meaning there is nothing to replay. The entry is abandoned so the next request re-executes.
-Concurrent waiters receive a 503 rather than blocking forever.
+A shared durable backend would require more than replacing the map:
 
-**Rejected: delete the entry on 5xx and allow re-execution.**
-Tempting for "transient" errors, but the library cannot distinguish a transient failure
-(DB timeout) from a partial write (charge written, email failed). Erring on the side of
-caching preserves safety over convenience.
+- **Atomic ownership:** claim a key together with its fingerprint and execution state,
+  using a unique database constraint or a Redis conditional insert. Only the owner
+  should publish or abandon that execution; use an ownership token to prevent stale
+  workers from modifying replacement records.
+- **Cross-process waiting:** replace local channels with polling, notifications, or an
+  explicit in-flight response such as `409` with `Retry-After`. Blocking across nodes
+  is possible, but needs a distributed result-notification mechanism.
+- **Crash recovery:** define how an abandoned execution is detected and reclaimed.
+  Lease expiry alone cannot prove that a side effect did not occur. Transactional
+  integration with the business operation, or reconciliation, is needed for stronger
+  guarantees.
+- **Retention:** use backend-managed expiry and define whether retention starts at
+  claim or completion. Keep result retention separate from execution leases, and
+  account for eviction and durability guarantees of the chosen backend.
+- **Request identity:** define tenant scoping and which query parameters or headers
+  affect the operation before sharing a key namespace across instances.
 
----
+## Validation and remaining gaps
 
-## Decision 4: memory must be bounded
+Run the existing suite with:
 
-**Choice: fixed entry cap with oldest-committed-first eviction, plus a background TTL sweep.**
+```sh
+go test -race ./...
+```
 
-`NewStore(max, ttl)` limits the map to `max` entries. When the cap is reached,
-`evictLocked` removes an expired-and-done entry first; failing that, the oldest committed
-entry. In-flight entries are never evicted — evicting them would strand waiting goroutines
-on a channel that never closes.
+It covers basic replay, concurrent matching requests, body mismatches, stored `5xx`,
+panic recovery followed by re-execution, completed-record expiry, header replay, and
+independent keys. The capacity test inserts beyond capacity but does not assert the
+record count or eviction order.
 
-A background goroutine sweeps every `ttl/2`, deleting expired committed entries to
-reclaim memory between natural evictions.
-
-**Rejected: TTL only, no size cap.**
-A TTL alone does not bound peak memory. Under load, the map can grow without limit until
-the sweep fires. A size cap provides a hard upper bound regardless of sweep timing.
-
-**Rejected: LRU via doubly-linked list.**
-An LRU list adds complexity and per-operation overhead. The eviction policy only matters
-at capacity, which should be rare in a correctly-sized deployment. Oldest-first is
-O(n) only at eviction time, which is acceptable given the alternative complexity cost.
-
----
-
-## Decision 5: requests without an Idempotency-Key header
-
-**Choice: pass through to the handler unchanged.**
-
-The middleware is opt-in per request. A missing key means the caller has not requested
-idempotency guarantees; the request executes normally every time.
-
-**Rejected: return 400 Bad Request.**
-Mandating the header would prevent the middleware from wrapping endpoints that serve both
-idempotent and non-idempotent clients. The caller is in the best position to decide
-whether it needs the guarantee.
-
----
-
-## What changes for persistence and multi-node
-
-The current implementation is in-memory, single-process. Extending it requires:
-
-1. **Persistent store** (Redis, Postgres): replace `getOrCreate`, `commit`, `abandon` with
-   database-backed equivalents. The critical property — atomic "get or insert in-flight" —
-   maps to a `SET NX` in Redis or an `INSERT ... ON CONFLICT DO NOTHING` with a
-   subsequent `SELECT` in Postgres.
-
-2. **Distributed lock for in-flight**: the channel-based blocking model only works within
-   one process. Across nodes, a retry landing on a different node cannot wait on another
-   node's goroutine. The practical replacement is: return 409 with a `Retry-After` header
-   while the key is in-flight, and let the caller retry. This reintroduces the round-trip
-   cost that blocking avoids, but it is unavoidable across a process boundary.
-
-3. **Clock skew for TTL**: a distributed store must use wall-clock TTL (e.g. Redis `EXPIRE`)
-   rather than in-process `time.Now()` comparisons, and all nodes must agree on expiry
-   times within acceptable skew.
+Further tests would be needed for waiter cancellation, panic waiters, method and path
+mismatches, handlers exceeding TTL, saturation with only in-flight entries, and
+response-writer compatibility. These are limits of the current implementation;
+this document introduces no runtime changes.
